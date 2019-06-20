@@ -17,6 +17,7 @@
 package zipkin2.reporter.kafka;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -33,6 +34,8 @@ import zipkin2.Call;
 import zipkin2.Callback;
 import zipkin2.CheckResult;
 import zipkin2.codec.Encoding;
+import zipkin2.codec.SpanBytesDecoder;
+import zipkin2.internal.AggregateCall;
 import zipkin2.reporter.AwaitableCallback;
 import zipkin2.reporter.BytesMessageEncoder;
 import zipkin2.reporter.Sender;
@@ -223,8 +226,13 @@ public final class KafkaSender extends Sender {
    */
   @Override public zipkin2.Call<Void> sendSpans(List<byte[]> encodedSpans) {
     if (closeCalled) throw new IllegalStateException("closed");
-    byte[] message = encoder.encode(encodedSpans);
-    return new KafkaCall(message);
+    List<Call<Void>> calls = new ArrayList<>(encodedSpans.size());
+    for (byte[] encodedSpan: encodedSpans) {
+      //TODO this might be too expensive
+      String traceId = SpanBytesDecoder.JSON_V2.decodeOne(encodedSpan).traceId();
+      calls.add(new KafkaCall(traceId.getBytes(), encodedSpan));
+    }
+    return AggregateCall.newVoidCall(calls);
   }
 
   /** Ensures there are no problems reading metadata about the topic. */
@@ -278,15 +286,17 @@ public final class KafkaSender extends Sender {
   }
 
   class KafkaCall extends Call.Base<Void> { // KafkaFuture is not cancelable
+    private final byte[] key;
     private final byte[] message;
 
-    KafkaCall(byte[] message) {
+    KafkaCall(byte[] key, byte[] message) {
+      this.key = key;
       this.message = message;
     }
 
     @Override protected Void doExecute() throws IOException {
       AwaitableCallback callback = new AwaitableCallback();
-      get().send(new ProducerRecord<>(topic, message), new CallbackAdapter(callback));
+      get().send(new ProducerRecord<>(topic, key, message), new CallbackAdapter(callback));
       callback.await();
       return null;
     }
@@ -296,7 +306,7 @@ public final class KafkaSender extends Sender {
     }
 
     @Override public Call<Void> clone() {
-      return new KafkaCall(message);
+      return new KafkaCall(key, message);
     }
   }
 
